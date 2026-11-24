@@ -10,6 +10,8 @@
 
 #include <torch/extension.h>
 
+#include "storage_stream_tracker.hpp"
+
 struct MegaMoeTilingData;
 
 namespace deepep::megamoe_train::ops {
@@ -39,7 +41,8 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor grad_y, 
                                    torch::Tensor training_saved_state, torch::Tensor dispatch_output,
                                    int64_t max_recv_tokens, int rank, int world_size,
                                    std::size_t symmetric_buffer_bytes, uint64_t ffts_addr, void* symmetric_buffer,
-                                   double swiglu_limit = 0.0, const std::string& save_gmm1_output = "bf16");
+                                   double swiglu_limit = 0.0, const std::string& save_gmm1_output = "bf16",
+                                   bool same_stream_saved_state = false);
 
 }  // namespace deepep::megamoe_train::ops
 
@@ -78,6 +81,7 @@ private:
     torch::Tensor context_;
     int context_rank_ = -1;
     int context_world_size_ = -1;
+    SavedStorageStreams saved_streams_;
 };
 
 }  // namespace deepep::megamoe_train

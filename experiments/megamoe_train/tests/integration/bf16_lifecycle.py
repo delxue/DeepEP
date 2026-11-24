@@ -139,6 +139,32 @@ def main():
     )
     (y * dy).sum().backward()
     assert all(torch.equal(a, b) for a, b in zip(capture(values, y, counts), sequential[0])), (rank, "foreign storage")
+
+    # Raw cloned saved state must keep the conservative external-storage path.
+    for foreign_state in (False, True):
+        x, weights, w1, w2 = templates
+        raw = op._executor.forward(x, ids, weights, w1, w2, m * size * e, 0.0, "bf16")
+        if foreign_state:
+            producer_stream.wait_stream(construction_stream)
+            with torch.npu.stream(producer_stream):
+                state = [tensor.clone() for tensor in (raw.counts, raw.saved_state, raw.dispatch_output)]
+            construction_stream.wait_stream(producer_stream)
+        else:
+            state = [raw.counts, raw.saved_state, raw.dispatch_output]
+        result = op._executor.backward(dy, weights, w1, w2, *state, m * size * e, 0.0, "bf16")
+        if foreign_state:
+            del state
+            with torch.npu.stream(producer_stream):
+                _churn = [torch.empty_like(raw.saved_state).fill_(255) for _ in range(16)]
+        actual = [
+            raw.y.cpu(),
+            raw.counts.cpu(),
+            result.dx.cpu(),
+            result.dtopk_weights.cpu(),
+            result.dw1.cpu(),
+            result.dw2.cpu(),
+        ]
+        assert all(torch.equal(a, b) for a, b in zip(actual, sequential[0])), (rank, "saved state", foreign_state)
     op.close()
     op.close()
     expect_error(lambda: forward(op, "bf16", 0.0), "closed")

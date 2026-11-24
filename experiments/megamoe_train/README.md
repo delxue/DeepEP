@@ -241,3 +241,19 @@ python -u experiments/megamoe_train/tests/bf16/test_mega_moe.py 0,1 \
 去掉 `--case-id` 可运行所选套件，`--list-cases` 仅列出配置。
 精度测试须预留 CPU FP64 参考计算及梯度所需内存；仅运行性能测试不构成精度验收。
 可用 `--output <新目录>` 指定报告目录，该目录不能已存在。
+
+### Saved-state stream provenance
+
+The executor weakly tracks the storage identity and creation stream of its
+counts, saved state and dispatch output. Matching backward calls on that stream
+reuse these buffers through stream ordering without a redundant recordStream.
+The tracker never owns activation payloads and prunes expired storage entries.
+Aliases retain the same provenance; cloned, resized, externally supplied or
+stream-mismatched state falls back to allocator stream recording. External inputs,
+weight tensors and caller-owned outputs retain their existing protection.
+Separate live forward graphs still own separate saved tensors; no activation
+buffer is shared or overwritten. The BF16 compute and saved-state mode are unchanged.
+
+CPU provenance regression:
+`python -m pytest experiments/megamoe_train/tests/bf16/test_storage_stream_tracker.py`.
+The device lifecycle regression also covers cloned saved state from another stream.

@@ -310,7 +310,7 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, t
                                    torch::Tensor trainingSavedState, torch::Tensor dispatchOutput,
                                    int64_t maxRecvTokens, int rank, int worldSize, std::size_t symmetricBufferBytes,
                                    uint64_t ffts_addr, void* symmetricBuffer, double swigluLimit,
-                                   const std::string& save_gmm1_output)
+                                   const std::string& save_gmm1_output, bool same_stream_saved_state)
 {
     const int64_t m = gradY.size(0);
     const int64_t k = gradY.size(1);
@@ -459,9 +459,15 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, t
     const auto stream = c10_npu::getCurrentNPUStream();
     // Preserve dependencies for caller-owned inputs. All gradient outputs and
     // backward scratch were allocated on the current launch stream above.
-    for (const auto* tensor :
-         {&context, &gradY, &topkWeights, &weight1, &weight2, &expertTokenNums, &trainingSavedState, &dispatchOutput}) {
+    for (const auto* tensor : {&context, &gradY, &topkWeights, &weight1, &weight2}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
+    }
+    // Only executor-owned state with matching storage and creation stream can
+    // rely on same-stream reuse. Transformed or external state stays protected.
+    if (!same_stream_saved_state) {
+        for (const auto* tensor : {&expertTokenNums, &trainingSavedState, &dispatchOutput}) {
+            c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
+        }
     }
     return {gradX, gradTopkWeights, gradWeight1, gradWeight2};
 }
@@ -485,6 +491,7 @@ void BF16Executor::close()
 {
     address_ = 0;
     context_ = torch::Tensor();
+    saved_streams_.clear();
 }
 
 ops::ForwardResult BF16Executor::forward(torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
@@ -492,9 +499,12 @@ ops::ForwardResult BF16Executor::forward(torch::Tensor x, torch::Tensor topk_ids
                                          double swiglu_limit, const std::string& save_gmm1_output)
 {
     TORCH_CHECK(address_ != 0, "training operator has been closed");
-    return ops::MegaMoeBF16Forward(Context(x), x, topk_ids, topk_weights, weight1, weight2, max_recv_tokens, rank_,
-                                   world_size_, SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(), swiglu_limit,
-                                   save_gmm1_output);
+    auto result = ops::MegaMoeBF16Forward(Context(x), x, topk_ids, topk_weights, weight1, weight2, max_recv_tokens,
+                                          rank_, world_size_, SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(),
+                                          swiglu_limit, save_gmm1_output);
+    saved_streams_.remember({result.counts.storage(), result.saved_state.storage(), result.dispatch_output.storage()},
+                            c10_npu::getCurrentNPUStream().unwrap());
+    return result;
 }
 
 ops::ForwardResult BF16Executor::forward_out(torch::Tensor out, torch::Tensor x, torch::Tensor topk_ids,
@@ -504,9 +514,12 @@ ops::ForwardResult BF16Executor::forward_out(torch::Tensor out, torch::Tensor x,
 {
     TORCH_CHECK(address_ != 0, "training operator has been closed");
     TORCH_CHECK(out.defined(), "y must be a defined output tensor");
-    return ops::MegaMoeBF16Forward(Context(x), x, topk_ids, topk_weights, weight1, weight2, max_recv_tokens, rank_,
-                                   world_size_, SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(), swiglu_limit,
-                                   save_gmm1_output, out);
+    auto result = ops::MegaMoeBF16Forward(Context(x), x, topk_ids, topk_weights, weight1, weight2, max_recv_tokens,
+                                          rank_, world_size_, SymmetricBufferBytes(), ffts_addr_, SymmetricBuffer(),
+                                          swiglu_limit, save_gmm1_output, out);
+    saved_streams_.remember({result.counts.storage(), result.saved_state.storage(), result.dispatch_output.storage()},
+                            c10_npu::getCurrentNPUStream().unwrap());
+    return result;
 }
 
 ops::BackwardResult BF16Executor::backward(torch::Tensor grad_y, torch::Tensor topk_weights, torch::Tensor weight1,
@@ -515,9 +528,12 @@ ops::BackwardResult BF16Executor::backward(torch::Tensor grad_y, torch::Tensor t
                                            const std::string& save_gmm1_output)
 {
     TORCH_CHECK(address_ != 0, "training operator has been closed");
+    const bool same_stream_saved_state = saved_streams_.all_on(
+        {counts.storage(), saved_state.storage(), dispatch_output.storage()}, c10_npu::getCurrentNPUStream().unwrap());
     return ops::MegaMoeBF16Backward(Context(grad_y), grad_y, topk_weights, weight1, weight2, counts, saved_state,
                                     dispatch_output, max_recv_tokens, rank_, world_size_, SymmetricBufferBytes(),
-                                    ffts_addr_, SymmetricBuffer(), swiglu_limit, save_gmm1_output);
+                                    ffts_addr_, SymmetricBuffer(), swiglu_limit, save_gmm1_output,
+                                    same_stream_saved_state);
 }
 
 torch::Tensor BF16Executor::Context(const torch::Tensor& like)
