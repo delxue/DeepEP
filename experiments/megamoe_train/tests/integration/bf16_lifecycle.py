@@ -114,6 +114,31 @@ def main():
         values, y, counts = forward(op, "bf16", 0.0, functional=True)
         (y * dy).sum().backward()
     assert all(torch.equal(a, b) for a, b in zip(capture(values, y, counts), sequential[0])), (rank, "32 iterations")
+
+    # Caller-owned inputs and output may originate on another stream even
+    # though the operator itself always runs on its construction stream.
+    construction_stream = torch.npu.current_stream()
+    producer_stream = torch.npu.Stream()
+    producer_stream.wait_stream(construction_stream)
+    with torch.npu.stream(producer_stream):
+        values = [value.clone().requires_grad_() for value in templates]
+        foreign_ids = ids.clone()
+        y = torch.empty_like(values[0], requires_grad=False)
+        counts = torch.zeros(e, dtype=torch.int32, device=device)
+    construction_stream.wait_stream(producer_stream)
+    bf16_mega_moe_train(
+        y,
+        values[2],
+        values[3],
+        op,
+        cumulative_local_expert_recv_stats=counts,
+        x=values[0],
+        topk_idx=foreign_ids,
+        topk_weights=values[1],
+        max_recv_tokens=m * size * e,
+    )
+    (y * dy).sum().backward()
+    assert all(torch.equal(a, b) for a, b in zip(capture(values, y, counts), sequential[0])), (rank, "foreign storage")
     op.close()
     op.close()
     expect_error(lambda: forward(op, "bf16", 0.0), "closed")

@@ -292,9 +292,15 @@ ForwardResult MegaMoeBF16Forward(torch::Tensor context, torch::Tensor x, torch::
         static_cast<uint32_t>(platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic()),
         symmetricBuffer, symmetricBufferBytes, rank, worldSize, ffts_addr);
     const auto stream = c10_npu::getCurrentNPUStream();
-    for (const auto* tensor : {&context, &x, &topkIds, &topkWeights, &weight1, &weight2, &y, &expertTokenNums,
-                               &trainingSavedState, &dispatchOutput, &forwardTransientWorkspace}) {
+    // Inputs may originate on another stream. Newly allocated outputs and scratch
+    // use this launch stream, so its ordering already protects their reuse.
+    // Recording them would unnecessarily defer their frees behind NPU events.
+    for (const auto* tensor : {&context, &x, &topkIds, &topkWeights, &weight1, &weight2}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
+    }
+    // The output-first API accepts caller-owned storage with an unknown origin.
+    if (out.defined()) {
+        c10_npu::NPUCachingAllocator::recordStream(y.storage().data_ptr(), stream);
     }
     return {y, expertTokenNums, trainingSavedState, dispatchOutput};
 }
@@ -451,9 +457,10 @@ BackwardResult MegaMoeBF16Backward(torch::Tensor context, torch::Tensor gradY, t
         static_cast<uint32_t>(platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic()),
         symmetricBuffer, symmetricBufferBytes, rank, worldSize, ffts_addr);
     const auto stream = c10_npu::getCurrentNPUStream();
+    // Preserve dependencies for caller-owned inputs. All gradient outputs and
+    // backward scratch were allocated on the current launch stream above.
     for (const auto* tensor :
-         {&context, &gradY, &topkWeights, &weight1, &weight2, &expertTokenNums, &trainingSavedState, &dispatchOutput,
-          &gradX, &gradTopkWeights, &gradWeight1, &gradWeight2, &backwardWorkspace}) {
+         {&context, &gradY, &topkWeights, &weight1, &weight2, &expertTokenNums, &trainingSavedState, &dispatchOutput}) {
         c10_npu::NPUCachingAllocator::recordStream(tensor->storage().data_ptr(), stream);
     }
     return {gradX, gradTopkWeights, gradWeight1, gradWeight2};
